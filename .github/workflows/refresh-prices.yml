@@ -1,0 +1,180 @@
+name: Refresh Market prices
+
+# Downloads every server's Market prices and uploads them to the Worker (R2).
+# No git commit: a code push does not need to happen for prices to update.
+# This repo is public so its Actions minutes are free; the site's own repo is private.
+#
+# GitHub's schedule cron often skips hours. Each run therefore waits until just after the next Price
+# Snapshot and starts the next run itself, or backs off and retries when the refresh failed; the timing
+# lives in tools/refresh_wait.js. The schedule is only a backup when that chain has died.
+# Concurrency keeps a backup cron from overlapping a live chain.
+on:
+  schedule:
+    - cron: "10 * * * *" # Minute must match START_MINUTE in tools/refresh_wait.js (tools/check_refresh_wait.js checks it).
+  workflow_dispatch:
+
+concurrency:
+  group: refresh-prices
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  issues: write # the stale-price alert opens and closes an issue
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # The first run after a short market.json seeds every material's full range (about 9,000 extra requests).
+    # That run's Fetch takes about 31 minutes instead of 10. Any change that triggers it (a longer HISTORY_DAYS, a
+    # new market.json shape) must keep this limit above that: on 2026-11-05 #49 started a seed under a 30-minute
+    # limit, every run was killed mid-Fetch, and prices froze for three hours.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Recipes, the Season Shop, the Daeva Pass, quna.js and yesterday's market.json all come from the live site,
+      # so this public repo never holds a copy of the private site repo's data that can drift.
+      - name: Pull inputs from the live site
+        env:
+          UPLOAD_BASE_URL: ${{ secrets.UPLOAD_BASE_URL }}
+        run: bash tools/pull_inputs.sh
+      - name: Fetch prices
+        env:
+          UPLOAD_TOKEN: ${{ secrets.UPLOAD_TOKEN }}
+          UPLOAD_BASE_URL: ${{ secrets.UPLOAD_BASE_URL }}
+        run: python -I tools/fetch_prices.py
+      - name: Split per-server market files
+        run: python -I tools/split_market.py
+      - name: Upload to the Worker
+        env:
+          UPLOAD_TOKEN: ${{ secrets.UPLOAD_TOKEN }}
+          UPLOAD_BASE_URL: ${{ secrets.UPLOAD_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${UPLOAD_TOKEN:-}" ] || [ -z "${UPLOAD_BASE_URL:-}" ]; then
+            echo "::error::Set Actions secrets UPLOAD_TOKEN and UPLOAD_BASE_URL"
+            exit 1
+          fi
+          base="${UPLOAD_BASE_URL%/}"
+          put() {
+            local file="$1" key="$2"
+            echo "PUT $key"
+            curl -fsS -X PUT \
+              -H "Authorization: Bearer $UPLOAD_TOKEN" \
+              -H "Content-Type: application/json; charset=utf-8" \
+              --data-binary @"$file" \
+              "$base/__upload/$key" > /dev/null
+          }
+          put data/prices.json data/prices.json
+          put data/market.json data/market.json
+          for f in data/market/*.json; do
+            put "$f" "data/market/$(basename "$f")"
+          done
+          quna_n=0
+          if [ -d data/quna ]; then
+            for f in data/quna/*.json; do
+              [ -e "$f" ] || continue
+              put "$f" "data/quna/$(basename "$f")"
+              quna_n=$((quna_n + 1))
+            done
+          fi
+          # Today's Price History day (UTC). Every run replaces it, so the day's last run wins.
+          for f in data/history/*.json; do
+            put "$f" "data/history/$(basename "$f")"
+          done
+          # Each Server's whole Price History, today folded in. A Server whose stored file could not be read has none here.
+          hist_n=0
+          for f in data/history/server/*.json; do
+            [ -e "$f" ] || continue
+            put "$f" "data/history/server/$(basename "$f")"
+            hist_n=$((hist_n + 1))
+          done
+          echo "Uploaded prices, market history, $(ls data/market/*.json | wc -l) market server files, ${quna_n} Quna server files, Price History $(ls data/history/*.json | xargs -n1 basename) and ${hist_n} Server Price Histories"
+
+  # The sleep is computed and slept on this runner only. Do not mix GitHub's createdAt with the runner clock:
+  # that mismatch slept past the job limit on 2026-11-01 and killed the chain.
+  queue-next:
+    needs: refresh
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      # Players saw frozen prices before anyone else did on 2026-11-05: killed runs end "cancelled", which GitHub
+      # does not flag. This step opens a prices-stale issue past two hours and closes it once prices are fresh.
+      # It never fails the job, so the chain below always runs.
+      - name: Alert when live prices are stale
+        env:
+          UPLOAD_BASE_URL: ${{ secrets.UPLOAD_BASE_URL }}
+        run: |
+          set -u
+          base="${UPLOAD_BASE_URL%/}"
+          [ -n "$base" ] || { echo "UPLOAD_BASE_URL unset; no stale check"; exit 0; }
+          at=$(curl -fsS -m 30 "$base/data/prices.json" | jq -r '.snapshotAt // .fetchedAt // empty' || true)
+          [ -n "$at" ] || { echo "::warning::Could not read the live prices.json"; exit 0; }
+          age=$(( ($(date -u +%s) - $(date -u -d "$at" +%s)) / 60 ))
+          echo "Live prices are ${age} minutes old (Price Snapshot ${at})"
+          open=$(gh issue list --label prices-stale --state open --json number -q '.[0].number' || true)
+          if [ "$age" -gt 120 ]; then
+            echo "::error::Live prices are ${age} minutes old"
+            gh label create prices-stale --color B60205 --description "Live Market prices stopped updating" --force >/dev/null || true
+            msg="Live prices are ${age} minutes old (Price Snapshot ${at}). Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. See docs/agents/stale-prices.md."
+            if [ -n "$open" ]; then gh issue comment "$open" --body "$msg" || true
+            else gh issue create --title "Live Market prices are stale" --label prices-stale --body "$msg" || true; fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "Prices are fresh again (${age} minutes old)." || true
+          fi
+      - name: Wait for the next Price Snapshot, then start the next refresh
+        env:
+          REFRESH_RESULT: ${{ needs.refresh.result }}
+        run: |
+          set -u
+          # "Now" comes from the exchange's Date header: the runner clock was an hour off once.
+          # The wait is at most an hour, well under timeout-minutes, so a slow runner cannot cancel us mid-sleep.
+          hdr=$(curl -fsSI -m 30 https://aion2.exchange/api/health | tr -d '\r' | sed -n 's/^[Dd]ate: //p' || true)
+          now=$(date -u +%s)
+          if [ -n "$hdr" ]; then now=$(date -u -d "$hdr" +%s || date -u +%s); fi
+          # Consecutive runs before this one that did not succeed set the retry backoff. A refresh killed by its
+          # timeout ends "cancelled", not "failure", and must back off too.
+          failures=0
+          if [ "$REFRESH_RESULT" != "success" ]; then
+            failures=$(gh run list --workflow refresh-prices.yml --limit 10 --json databaseId,status,conclusion \
+              -q "[.[] | select(.databaseId != $GITHUB_RUN_ID and .status == \"completed\")] | first(range(length) as \$i | select(.[\$i].conclusion == \"success\") | \$i) // length") || failures=0
+          fi
+          # bash -e would end the step on a node failure and break the chain, so fall back to five minutes.
+          wait=$(node tools/refresh_wait.js "$REFRESH_RESULT" "$now" "$failures") || wait=300
+          echo "Refresh ${REFRESH_RESULT}, runs just before it that did not succeed: ${failures}. Sleeping ${wait}s before queueing the next refresh"
+          sleep "$wait"
+
+          me=$(gh run view "$GITHUB_RUN_ID" --json createdAt -q .createdAt || true)
+          later=0
+          if [ -n "$me" ]; then
+            if ! later=$(gh run list --workflow refresh-prices.yml --limit 30 --json databaseId,event,status,conclusion,createdAt \
+              -q "[.[] | select(.databaseId != $GITHUB_RUN_ID and .createdAt > \"$me\" and .conclusion != \"cancelled\")] | length"); then
+              echo "Could not list runs; queueing the next refresh anyway"
+              later=0
+            fi
+          else
+            echo "Could not read this run's start; queueing the next refresh anyway"
+          fi
+          if [ "${later:-0}" -gt 0 ]; then
+            echo "A later refresh already carries the chain (schedule or manual run)"
+            exit 0
+          fi
+          for i in 1 2 3 4 5; do
+            if gh workflow run refresh-prices.yml --ref main; then exit 0; fi
+            echo "Dispatch failed, retry $i"
+            sleep 15
+          done
+          echo "::error::Could not queue the next refresh"
+          exit 1
