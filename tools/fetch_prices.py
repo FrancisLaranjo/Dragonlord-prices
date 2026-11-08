@@ -138,7 +138,7 @@ def server_prices(server, wanted_items, wanted_names, artisan_keys, unique_gear)
 
     items = all_items(sid, "24h")
     week = {it["item_key"]: it.get("change_pct") for it in all_items(sid, "7d")}
-    prices, targets, market = {}, {}, {}
+    prices, targets, market, goods = {}, {}, {}, {}
     # Pass ROI values bound Unique gear at the cheapest Unique gear on the Market. Every Unique rerolls gear lines,
     # so none sells for much less than the rest; a listing under a quarter of the median is a stray dump.
     unique_asks = sorted(it["price"] for it in items
@@ -158,7 +158,9 @@ def server_prices(server, wanted_items, wanted_names, artisan_keys, unique_gear)
             w = week.get(it["item_key"])
             market[str(it["item_key"])] = {"name": it["name"], "cat": it["category"]["name"],
                                            "row": [round(price), it["listings"], None if change is None else round(change, 1), None if w is None else round(w, 1)]}
-    return str(sid), {"items": prices, "targets": targets, "crafts": crafts, "market": market,
+        else:
+            goods[str(it["item_key"])] = [it["name"], it["category"]["name"], round(price), it["listings"] or 0]
+    return str(sid), {"items": prices, "targets": targets, "crafts": crafts, "market": market, "goods": goods,
                       "uniqueFloor": None if unique_floor is None else round(unique_floor)}
 
 
@@ -175,6 +177,38 @@ def load_previous_market():
         return json.loads((ROOT / "data" / "market.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         return {}
+
+
+def load_previous_goods():
+    """Yesterday's goods.json, the carry-file for each Market Good's last listed day. Optional: without it every
+    Market Good starts with no listed day, and the planner reads it as Sellable from its next listing on."""
+    try:
+        return json.loads((ROOT / "data" / "goods.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def goods_file(results, fetched_at, prev):
+    """Every Market Good per Server as [name, category, Ask, listings today, last day listed or null]: everything the
+    price site sells beyond materials, with no Price History. A Good listed today takes today's lowest Ask and today as
+    its day. One unlisted today keeps the Ask and day it was last seen listed, carried from the previous goods.json.
+    The site only gives a last price without its day, so a Good never seen listed here has no day and no Sellable
+    copies until it lists (the planner's ADR 0005)."""
+    day = fetched_at[:10]
+    servers = {}
+    for sid, res in results.items():
+        old = prev.get("servers", {}).get(sid, {})
+        rows = {}
+        for key, (name, cat, price, listings) in res["goods"].items():
+            was = old.get(key)
+            if listings > 0:
+                rows[key] = [name, cat, price, listings, day]
+            elif was and was[4]:
+                rows[key] = [name, cat, was[2], 0, was[4]]
+            else:
+                rows[key] = [name, cat, price, 0, None]
+        servers[sid] = rows
+    return {"fetchedAt": fetched_at, "day": day, "servers": servers}
 
 
 def load_previous_quna():
@@ -542,6 +576,7 @@ def main():
     log("prices: done")
     fetched_at = fetched_now()
     prev = load_previous_market()
+    goods = goods_file(results, fetched_at, load_previous_goods())
     prev_quna = load_previous_quna()
     seeds = seed_closes(results, prev, datetime.date.fromisoformat(fetched_at[:10]))
     log("seed: done")
@@ -553,6 +588,7 @@ def main():
     log("history: done")
     for res in results.values():
         del res["market"]
+        del res["goods"]
     out = {
         "fetchedAt": fetched_at,
         **({"snapshotAt": price_snapshot_at} if price_snapshot_at else {}),
@@ -567,6 +603,7 @@ def main():
     log("quna: done")
     (ROOT / "data" / "prices.json").write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     (ROOT / "data" / "market.json").write_text(json.dumps(market, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    (ROOT / "data" / "goods.json").write_text(json.dumps(goods, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     (ROOT / "data" / "quna.json").write_text(json.dumps(quna_out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     collected = sum(1 for snap in quna.values() if snap.get("collected"))
     with_hist = sum(1 for snap in quna.values() if sum(1 for v in (snap.get("history") or {}).get("bestKinaPerQuna") or [] if v is not None) >= 2)
