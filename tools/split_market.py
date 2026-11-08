@@ -1,7 +1,8 @@
 """Split data/market.json and data/quna.json into the per-Server files the page reads one at a time.
 
 Run: python -I tools/split_market.py
-Writes data/market/<serverId>.json and data/quna/<serverId>.json, which the refresh workflow uploads to the Worker.
+Writes data/market/<serverId>.json, data/goods/<serverId>.json and data/quna/<serverId>.json, which the refresh
+workflow uploads to the Worker.
 """
 import json
 import pathlib
@@ -28,6 +29,13 @@ def main():
         }
         for sid, srv in market["servers"].items()
     })
+    goods_path = ROOT / "data" / "goods.json"
+    if goods_path.exists():
+        goods = json.loads(goods_path.read_text(encoding="utf-8"))
+        write_splits(ROOT / "data" / "goods", {
+            sid: {"fetchedAt": goods["fetchedAt"], "day": goods["day"], "items": items}
+            for sid, items in goods.get("servers", {}).items()
+        })
     quna_path = ROOT / "data" / "quna.json"
     if quna_path.exists():
         quna = json.loads(quna_path.read_text(encoding="utf-8"))

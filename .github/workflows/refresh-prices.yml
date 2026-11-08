@@ -75,6 +75,16 @@ jobs:
           for f in data/market/*.json; do
             put "$f" "data/market/$(basename "$f")"
           done
+          # Market Goods: everything the site sells beyond materials, and the carry-file for their last listed day.
+          goods_n=0
+          if [ -e data/goods.json ]; then
+            put data/goods.json data/goods.json
+            for f in data/goods/*.json; do
+              [ -e "$f" ] || continue
+              put "$f" "data/goods/$(basename "$f")"
+              goods_n=$((goods_n + 1))
+            done
+          fi
           quna_n=0
           if [ -d data/quna ]; then
             for f in data/quna/*.json; do
@@ -94,7 +104,7 @@ jobs:
             put "$f" "data/history/server/$(basename "$f")"
             hist_n=$((hist_n + 1))
           done
-          echo "Uploaded prices, market history, $(ls data/market/*.json | wc -l) market server files, ${quna_n} Quna server files, Price History $(ls data/history/*.json | xargs -n1 basename) and ${hist_n} Server Price Histories"
+          echo "Uploaded prices, market history, $(ls data/market/*.json | wc -l) market server files, ${goods_n} Market Goods server files, ${quna_n} Quna server files, Price History $(ls data/history/*.json | xargs -n1 basename) and ${hist_n} Server Price Histories"
 
   # The sleep is computed and slept on this runner only. Do not mix GitHub's createdAt with the runner clock:
   # that mismatch slept past the job limit on 2026-11-01 and killed the chain.

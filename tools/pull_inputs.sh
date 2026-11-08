@@ -14,3 +14,10 @@ for f in data/recipes.json data/shop.json data/pass.json data/quna.json data/mar
   curl -fsS -m 60 "$base/$f" -o "$f"
   echo "pulled $f ($(wc -c < "$f") bytes)"
 done
+# goods.json carries each Market Good's last listed day. It is optional: the first refresh that writes it has none.
+if curl -fsS -m 60 "$base/data/goods.json" -o data/goods.json; then
+  echo "pulled data/goods.json ($(wc -c < data/goods.json) bytes)"
+else
+  rm -f data/goods.json
+  echo "no data/goods.json yet: every Market Good starts with no listed day"
+fi
