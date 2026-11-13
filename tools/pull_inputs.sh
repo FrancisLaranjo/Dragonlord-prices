@@ -21,3 +21,10 @@ else
   rm -f data/goods.json
   echo "no data/goods.json yet: every Market Good starts with no listed day"
 fi
+# prices.json is what a Server whose pages keep failing carries forward. Optional: without it that Server is left out.
+if curl -fsS -m 60 "$base/data/prices.json" -o data/prices.json; then
+  echo "pulled data/prices.json ($(wc -c < data/prices.json) bytes)"
+else
+  rm -f data/prices.json
+  echo "no data/prices.json: a Server that fails this run has no previous prices to keep"
+fi

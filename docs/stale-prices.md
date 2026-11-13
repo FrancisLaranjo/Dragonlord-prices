@@ -42,3 +42,7 @@ Players see an old price-age chip, or a `prices-stale` issue is open. Work down 
    can change a refresh too. Check that repo's merges for the same day.
 
 The Fetch log prints a timed line per phase (`[  612s] seed: 9057 requests planned`). Read those first once the logs unlock.
+
+## When aion2.exchange is failing
+
+A Server whose pages keep failing is skipped and keeps its previous prices, so the run still uploads the fresh Servers. `staleServers` in `prices.json` and `market.json` maps each such Server id to when its prices were fetched, and its `market/<id>.json` and `goods/<id>.json` carry that time as `fetchedAt`. Twelve failed requests in a row (every retry spent) declare the API down and the rest of the run fails fast. If every Server fails, the Fetch step fails and nothing is uploaded.

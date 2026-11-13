@@ -66,17 +66,36 @@ def transient(err):
     return isinstance(err, (http.client.HTTPException, urllib.error.URLError, OSError, json.JSONDecodeError))
 
 
+# A failing get sleeps 5 + 10 + 20 = 35 seconds before it gives up. This many in a row (every retry spent, no success
+# between) means the API is down, not one flaky page: every later get then fails at once instead of burning 35 seconds
+# each, so an outage ends the run in about two minutes. Servers that finished before it keep their fresh prices.
+OUTAGE_AFTER = 12
+# No new Server's prices start after this many seconds into the run. A healthy run finishes them by about 1,600.
+PRICES_START_DEADLINE_S = 28 * 60
+FAILS_IN_A_ROW = 0
+
+
+class ApiDown(Exception):
+    pass
+
+
 def get(path):
-    global OBSERVED_AT
+    global OBSERVED_AT, FAILS_IN_A_ROW
+    if FAILS_IN_A_ROW >= OUTAGE_AFTER:
+        raise ApiDown(f"aion2.exchange failed {OUTAGE_AFTER} requests in a row")
     req = urllib.request.Request(f"{API}{path}", headers=UA)
     for attempt in range(GET_TRIES):
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 observed = r.headers.get("Date")
                 body = json.load(r)
+            FAILS_IN_A_ROW = 0
             break
         except Exception as err:
-            if attempt == GET_TRIES - 1 or not transient(err):
+            if not transient(err):
+                raise
+            if attempt == GET_TRIES - 1:
+                FAILS_IN_A_ROW += 1
                 raise
             time.sleep(2 ** attempt * 5)
     if observed:
@@ -119,8 +138,10 @@ def server_prices(server, wanted_items, wanted_names, artisan_keys, unique_gear)
     for key in artisan_keys:
         try:
             tree = get(f"/crafts/{key}?server={sid}")
-        except urllib.error.HTTPError:
-            continue  # the other faction's version of this item
+        except urllib.error.HTTPError as err:
+            if transient(err):
+                raise  # an outage, not the other faction's version of this item
+            continue
         # A server with no listing for some material leaves its price and the total empty.
         whole = lambda v: None if v is None else round(v)
         crafts[key] = {
@@ -164,6 +185,44 @@ def server_prices(server, wanted_items, wanted_names, artisan_keys, unique_gear)
                       "uniqueFloor": None if unique_floor is None else round(unique_floor)}
 
 
+def try_server(server, *args):
+    """server_prices, or (serverId, None) when this Server's pages kept failing or the run is out of time. Its
+    previous prices are kept instead (keep_previous)."""
+    try:
+        if time.monotonic() - STARTED > PRICES_START_DEADLINE_S:
+            raise TimeoutError("past the time budget")
+        return server_prices(server, *args)
+    except Exception as err:
+        print(f"Server {server['server_id']} skipped, its previous prices stay: {err!r}", file=sys.stderr)
+        return str(server["server_id"]), None
+
+
+def keep_previous(failed, prev_prices, prev_market, prev_goods, days):
+    """What to carry for each Server in `failed`, from the live files the run pulled:
+    {serverId: {"fetchedAt": when those prices were fetched, "prices", "market", "names", "goods"}}.
+    The Market closes are re-laid on today's `days`; today gets no close, because nothing was seen today.
+    A Server with no previous prices is left out, never written empty."""
+    kept = {}
+    for sid in failed:
+        prices = (prev_prices.get("prices") or {}).get(sid)
+        if not prices:
+            continue
+        srv = (prev_market.get("servers") or {}).get(sid)
+        market = None
+        if srv:
+            was = prev_market.get("days", [])
+            market = {"items": srv["items"],
+                      "closes": {k: [dict(zip(was, c)).get(d) for d in days] for k, c in srv["closes"].items()}}
+        kept[sid] = {
+            "fetchedAt": (prev_prices.get("staleServers") or {}).get(sid) or prev_prices["fetchedAt"],
+            "prices": prices,
+            "market": market,
+            "names": {k: prev_market["names"][k] for k in (market or {"items": {}})["items"] if k in prev_market.get("names", {})},
+            "goods": (prev_goods.get("servers") or {}).get(sid),
+        }
+    return kept
+
+
 HISTORY_DAYS = 30
 # The first day of Price History: the site's full range starts here (ADR 0003).
 HISTORY_FIRST_DAY = "2026-10-06"
@@ -175,6 +234,14 @@ NEW_MATERIAL_KNOWN = 5
 def load_previous_market():
     try:
         return json.loads((ROOT / "data" / "market.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def load_previous_prices():
+    """The live prices.json, pulled by tools/pull_inputs.sh. Optional: without it no Server can keep previous prices."""
+    try:
+        return json.loads((ROOT / "data" / "prices.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         return {}
 
@@ -570,8 +637,12 @@ def main():
     log(f"prices: {len(servers)} servers")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        results = dict(pool.map(lambda s: server_prices(s, wanted_items, wanted_names, artisan_keys, unique_gear), servers))
+        fetched = dict(pool.map(lambda s: try_server(s, wanted_items, wanted_names, artisan_keys, unique_gear), servers))
         quna = dict(pool.map(server_quna, servers))
+    results = {sid: res for sid, res in fetched.items() if res}
+    if not results:
+        sys.exit("Every Server's prices failed. Nothing is written, so the live prices stay as they are.")
+    failed = [sid for sid, res in fetched.items() if not res]
 
     log("prices: done")
     fetched_at = fetched_now()
@@ -581,6 +652,7 @@ def main():
     seeds = seed_closes(results, prev, datetime.date.fromisoformat(fetched_at[:10]))
     log("seed: done")
     market = market_file(results, fetched_at, prev, seeds)
+    # Before the carried Servers join market, so Price History never records a price nobody saw today.
     today_history = history_day(market)
     write_history(ROOT / "data" / "history", fetched_at[:10], today_history)
     write_server_histories(ROOT / "data" / "history" / "server", fetched_at[:10], today_history,
@@ -589,12 +661,29 @@ def main():
     for res in results.values():
         del res["market"]
         del res["goods"]
+    prev_prices = load_previous_prices()
+    kept = keep_previous(failed, prev_prices, prev, load_previous_goods(), market["days"])
+    stale = {sid: k["fetchedAt"] for sid, k in kept.items()}
+    for sid, k in kept.items():
+        results[sid] = k["prices"]
+        if k["market"]:
+            market["servers"][sid] = k["market"]
+            for key, name in k["names"].items():
+                market["names"].setdefault(key, name)
+        if k["goods"]:
+            goods["servers"][sid] = k["goods"]
+    if stale:
+        market["staleServers"] = stale
+    listed = [s for s in servers if str(s["server_id"]) in results]
+    if failed:
+        print(f"{len(failed)} Servers skipped, {len(stale)} kept their previous prices: {', '.join(failed)}", file=sys.stderr)
     out = {
         "fetchedAt": fetched_at,
         **({"snapshotAt": price_snapshot_at} if price_snapshot_at else {}),
         "source": "https://aion2.exchange",
+        **({"staleServers": stale} if stale else {}),
         "servers": [{"id": str(s["server_id"]), "gameKey": str(s["game_server_key"]), "name": s["name"], "region": s["region_name"],
-                     "faction": s["faction"], "race": "light" if s["faction"] == "Elyos" else "dark"} for s in servers],
+                     "faction": s["faction"], "race": "light" if s["faction"] == "Elyos" else "dark"} for s in listed],
         "prices": results,
     }
     attach_quna_histories(quna, prev_quna)
@@ -607,7 +696,7 @@ def main():
     (ROOT / "data" / "quna.json").write_text(json.dumps(quna_out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     collected = sum(1 for snap in quna.values() if snap.get("collected"))
     with_hist = sum(1 for snap in quna.values() if sum(1 for v in (snap.get("history") or {}).get("bestKinaPerQuna") or [] if v is not None) >= 2)
-    print(f"{len(servers)} servers, {sum(len(v['items']) for v in results.values())} item prices, "
+    print(f"{len(listed)} servers, {sum(len(v['items']) for v in results.values())} item prices, "
           f"{len(market['names'])} market materials, {len(market['days'])} days of history, {len(seeds)} graphs seeded, "
           f"{collected}/{len(quna)} Quna snapshots collected, {with_hist}/{len(quna)} with history sparks")
 

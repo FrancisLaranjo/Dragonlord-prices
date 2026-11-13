@@ -21,9 +21,11 @@ def write_splits(directory, files):
 
 def main():
     market = json.loads((ROOT / "data" / "market.json").read_text(encoding="utf-8"))
+    # A Server whose refresh failed carries its previous data; its files say when that was fetched.
+    stale = market.get("staleServers", {})
     write_splits(ROOT / "data" / "market", {
         sid: {
-            "fetchedAt": market["fetchedAt"],
+            "fetchedAt": stale.get(sid, market["fetchedAt"]),
             "days": market["days"],
             "items": {k: market["names"][k] + row + [srv["closes"].get(k, [])] for k, row in srv["items"].items()},
         }
@@ -33,7 +35,7 @@ def main():
     if goods_path.exists():
         goods = json.loads(goods_path.read_text(encoding="utf-8"))
         write_splits(ROOT / "data" / "goods", {
-            sid: {"fetchedAt": goods["fetchedAt"], "day": goods["day"], "items": items}
+            sid: {"fetchedAt": stale.get(sid, goods["fetchedAt"]), "day": stale[sid][:10] if sid in stale else goods["day"], "items": items}
             for sid, items in goods.get("servers", {}).items()
         })
     quna_path = ROOT / "data" / "quna.json"

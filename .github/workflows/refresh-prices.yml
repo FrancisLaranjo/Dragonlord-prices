@@ -29,7 +29,7 @@ jobs:
     # That run's Fetch takes about 31 minutes instead of 10. Any change that triggers it (a longer HISTORY_DAYS, a
     # new market.json shape) must keep this limit above that: on 2026-11-05 #49 started a seed under a 30-minute
     # limit, every run was killed mid-Fetch, and prices froze for three hours.
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
