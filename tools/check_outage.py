@@ -55,4 +55,10 @@ assert k["market"] == {"items": {"a": [9, 3, 0, 0]}, "closes": {"a": [9, None]}}
 assert k["names"] == {"a": ["Ore", "Mats"]} and k["goods"] == {"g": ["Gem", "Goods", 5, 0, "d2"]}
 assert kept["3"]["fetchedAt"] == "2026-11-13T10:00+00:00", "a Server stale before keeps its older time"
 assert kept["3"]["market"] is None and kept["3"]["goods"] is None
+
+# 4. Servers the last run carried over are fetched first, oldest first, so the time budget never skips the same ones.
+servers = [{"server_id": n} for n in (1, 2, 3, 4)]
+order = fp.fetch_order(servers, {"staleServers": {"4": "2026-11-20T08:37+00:00", "2": "2026-11-26T07:40+00:00"}})
+assert [s["server_id"] for s in order] == [4, 2, 1, 3], order
+assert [s["server_id"] for s in fp.fetch_order(servers, {})] == [1, 2, 3, 4], "no stale Servers keeps the API's order"
 print("ok: outage path")

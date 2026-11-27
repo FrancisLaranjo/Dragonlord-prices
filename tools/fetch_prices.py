@@ -197,6 +197,15 @@ def try_server(server, *args):
         return str(server["server_id"]), None
 
 
+def fetch_order(servers, prev_prices):
+    """The order to fetch Servers in: those the last run carried over (staleServers), oldest fetch first, then the
+    rest in the API's order. The time budget runs out on the tail of the list, so in a fixed order the same Servers
+    were skipped run after run and went days without prices; now each run starts with whoever waited longest."""
+    stale = prev_prices.get("staleServers") or {}
+    at = lambda s: stale.get(str(s["server_id"]))
+    return sorted(servers, key=lambda s: (at(s) is None, at(s) or ""))
+
+
 def keep_previous(failed, prev_prices, prev_market, prev_goods, days):
     """What to carry for each Server in `failed`, from the live files the run pulled:
     {serverId: {"fetchedAt": when those prices were fetched, "prices", "market", "names", "goods"}}.
@@ -636,8 +645,9 @@ def main():
     price_snapshot_at = snapshot_at()
     log(f"prices: {len(servers)} servers")
 
+    order = fetch_order(servers, load_previous_prices())
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        fetched = dict(pool.map(lambda s: try_server(s, wanted_items, wanted_names, artisan_keys, unique_gear), servers))
+        fetched = dict(pool.map(lambda s: try_server(s, wanted_items, wanted_names, artisan_keys, unique_gear), order))
         quna = dict(pool.map(server_quna, servers))
     results = {sid: res for sid, res in fetched.items() if res}
     if not results:
